@@ -25,14 +25,18 @@ cd /tmp
 rm -rf primesieve  # Nettoyage si existe déjà
 git clone https://github.com/kimwalisch/primesieve.git
 cd primesieve
-cmake .
+cmake -DCMAKE_INSTALL_PREFIX=/usr/local .
 make -j$(nproc)
 make install
 ldconfig
 
+# Mise à jour du PATH pour inclure /usr/local/bin
+export PATH="/usr/local/bin:$PATH"
+echo 'export PATH="/usr/local/bin:$PATH"' >> ~/.bashrc
+
 # Vérification de l'installation de primesieve
 echo "✓ Vérification de primesieve..."
-primesieve --version || echo "⚠️ Attention: primesieve CLI peut ne pas être dans le PATH"
+/usr/local/bin/primesieve --version 2>/dev/null || primesieve --version || echo "⚠️ Erreur: primesieve non trouvé"
 
 # 3. Clone de NPGaps
 echo "📥 Clonage de NPGaps..."
