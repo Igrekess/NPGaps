@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Générateur de gaps parallèle optimisé pour 32 vCPUs et 256 GB RAM
+Générateur de gaps parallèle optimisé pour 32+ cores - Version Corrigée
 
-Optimisations:
-- Traitement parallèle sur 32 cores
-- Buffer en mémoire de plusieurs GB
-- Agrégation intelligente des résultats
-- Checkpoints robustes par worker
+Corrections:
+- Résolution du problème de pickling (pas de Manager)
+- Sérialisation JSON correcte
+- Fonction worker standalone
 
 Auteur: Pour le projet Théorie de la Persistance
 Date: 2025-11-05
@@ -17,24 +16,129 @@ import json
 import os
 import sys
 import time
-import hashlib
 import subprocess
 import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta
 import tempfile
 import multiprocessing as mp
-from multiprocessing import Pool, Manager, Lock
-from functools import partial
-import psutil
+from multiprocessing import Pool
 from typing import Tuple, List, Dict, Optional
+import psutil
 
+
+# ============================================================================
+# FONCTIONS WORKERS (doivent être au top-level pour pickling)
+# ============================================================================
+
+def generate_primes_chunk(start: int, stop: int) -> np.ndarray:
+    """
+    Génère les nombres premiers dans [start, stop] via primesieve CLI
+    Fonction standalone pour multiprocessing
+    """
+    with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.txt') as tmp:
+        tmp_path = tmp.name
+    
+    try:
+        cmd = ['primesieve', str(start), str(stop), '--print']
+        
+        with open(tmp_path, 'w') as outfile:
+            result = subprocess.run(cmd, stdout=outfile, stderr=subprocess.PIPE, 
+                                   text=True, timeout=3600)
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"primesieve error: {result.stderr}")
+        
+        primes = []
+        with open(tmp_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and line.isdigit():
+                    primes.append(int(line))
+        
+        return np.array(primes, dtype=np.uint64)
+        
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def encode_gaps(gaps: np.ndarray) -> np.ndarray:
+    """Encode les gaps en uint8 avec marqueur 255"""
+    result = []
+    for gap in gaps:
+        gap_int = int(gap)
+        if gap_int < 255:
+            result.append(gap_int)
+        else:
+            result.append(255)
+            result.append((gap_int >> 8) & 0xFF)
+            result.append(gap_int & 0xFF)
+    
+    return np.array(result, dtype=np.uint8)
+
+
+def process_chunk_worker(chunk_info: Tuple[int, int, int, Optional[int]]) -> Dict:
+    """
+    Worker fonction - traite un chunk de nombres
+    Fonction standalone pour éviter les problèmes de pickling
+    
+    Args:
+        chunk_info: (chunk_id, start, stop, prev_prime)
+        
+    Returns:
+        dict: Résultats du chunk
+    """
+    chunk_id, start, stop, prev_prime = chunk_info
+    
+    try:
+        # Générer les premiers du chunk
+        primes = generate_primes_chunk(start, stop)
+        
+        if len(primes) == 0:
+            return {
+                'chunk_id': chunk_id,
+                'success': True,
+                'num_primes': 0,
+                'gaps_encoded': np.array([], dtype=np.uint8),
+                'first_prime': None,
+                'last_prime': None
+            }
+        
+        # Calculer les gaps
+        if prev_prime is not None:
+            gaps = np.diff(np.concatenate([[prev_prime], primes]))
+        else:
+            gaps = np.diff(primes)
+        
+        # Encoder
+        gaps_encoded = encode_gaps(gaps)
+        
+        return {
+            'chunk_id': chunk_id,
+            'success': True,
+            'num_primes': len(primes),
+            'num_gaps': len(gaps),
+            'gaps_encoded': gaps_encoded,
+            'first_prime': int(primes[0]),
+            'last_prime': int(primes[-1]),
+            'bytes_size': len(gaps_encoded)
+        }
+        
+    except Exception as e:
+        return {
+            'chunk_id': chunk_id,
+            'success': False,
+            'error': str(e)
+        }
+
+
+# ============================================================================
+# CLASSE PRINCIPALE
+# ============================================================================
 
 class ParallelGapsGenerator:
-    """
-    Génère les gaps entre nombres premiers en parallèle
-    Exploite 32 cores et 256 GB RAM
-    """
+    """Générateur de gaps parallèle sans Manager (évite pickling)"""
     
     def __init__(self, target, start=None, output_dir="gaps_data", 
                  num_workers=None, buffer_size_gb=32):
@@ -59,15 +163,13 @@ class ParallelGapsGenerator:
         # Vérifier primesieve
         self.check_primesieve()
         
-        # Calcul de la taille optimale des chunks pour chaque worker
+        # Calcul de la taille des chunks
         interval_size = self.target - self.start_number
-        
-        # Avec 32 workers, on veut ~100-200 chunks par worker pour bon équilibrage
         target_chunks_per_worker = 150
         total_chunks = self.num_workers * target_chunks_per_worker
         self.chunk_size = max(int(interval_size / total_chunks), int(1e9))
         
-        # Arrondir à un multiple propre
+        # Arrondir
         if self.chunk_size >= 1e11:
             self.chunk_size = int(np.round(self.chunk_size / 1e11) * 1e11)
         elif self.chunk_size >= 1e10:
@@ -85,9 +187,8 @@ class ParallelGapsGenerator:
         self.metadata_file = self.output_dir / f"metadata_{file_suffix}.json"
         self.checkpoint_file = self.output_dir / f"checkpoint_{file_suffix}.json"
         
-        # Statistiques partagées
-        self.manager = Manager()
-        self.stats = self.manager.dict({
+        # Statistiques (dict simple, pas de Manager)
+        self.stats = {
             'start_time': None,
             'end_time': None,
             'total_gaps': 0,
@@ -95,13 +196,9 @@ class ParallelGapsGenerator:
             'chunks_processed': 0,
             'total_chunks': 0,
             'first_prime': None,
-            'last_prime': None,
-            'worker_stats': self.manager.dict()
-        })
-        
-        self.write_lock = Lock()
-        self.stats_lock = Lock()
-        
+            'last_prime': None
+        }
+    
     def check_primesieve(self):
         """Vérifie que primesieve est installé"""
         try:
@@ -117,137 +214,17 @@ class ParallelGapsGenerator:
             print("\nInstallation: pip install primesieve")
             sys.exit(1)
     
-    def generate_primes_chunk(self, start: int, stop: int) -> np.ndarray:
-        """
-        Génère les nombres premiers dans [start, stop] via primesieve CLI
-        Optimisé pour la parallélisation
-        
-        Args:
-            start: Début de l'intervalle
-            stop: Fin de l'intervalle
-            
-        Returns:
-            np.array: Array des nombres premiers (uint64)
-        """
-        with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.txt') as tmp:
-            tmp_path = tmp.name
-        
-        try:
-            cmd = ['primesieve', str(start), str(stop), '--print']
-            
-            with open(tmp_path, 'w') as outfile:
-                result = subprocess.run(cmd, stdout=outfile, stderr=subprocess.PIPE, 
-                                       text=True, timeout=3600)
-            
-            if result.returncode != 0:
-                raise RuntimeError(f"primesieve error: {result.stderr}")
-            
-            primes = []
-            with open(tmp_path, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and line.isdigit():
-                        primes.append(int(line))
-            
-            return np.array(primes, dtype=np.uint64)
-            
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-    
-    def encode_gaps(self, gaps: np.ndarray) -> np.ndarray:
-        """
-        Encode les gaps en uint8 avec marqueur 255 pour gaps >= 255
-        Format: gap < 255: valeur directe
-                gap >= 255: [255, high_byte, low_byte]
-        """
-        result = []
-        for gap in gaps:
-            gap_int = int(gap)
-            if gap_int < 255:
-                result.append(gap_int)
-            else:
-                result.append(255)
-                result.append((gap_int >> 8) & 0xFF)
-                result.append(gap_int & 0xFF)
-        
-        return np.array(result, dtype=np.uint8)
-    
-    def process_chunk(self, chunk_info: Tuple[int, int, int, Optional[int]]) -> Dict:
-        """
-        Traite un chunk de nombres et calcule les gaps
-        Fonction appelée par chaque worker
-        
-        Args:
-            chunk_info: (chunk_id, start, stop, prev_prime)
-            
-        Returns:
-            dict: Résultats du chunk
-        """
-        chunk_id, start, stop, prev_prime = chunk_info
-        
-        try:
-            # Générer les premiers du chunk
-            primes = self.generate_primes_chunk(start, stop)
-            
-            if len(primes) == 0:
-                return {
-                    'chunk_id': chunk_id,
-                    'success': True,
-                    'num_primes': 0,
-                    'gaps_encoded': np.array([], dtype=np.uint8),
-                    'first_prime': None,
-                    'last_prime': None,
-                    'needs_connection': False
-                }
-            
-            # Calculer les gaps
-            if prev_prime is not None:
-                # Gap de connexion avec le chunk précédent
-                gaps = np.diff(np.concatenate([[prev_prime], primes]))
-            else:
-                # Premier chunk (pas de gap de connexion)
-                gaps = np.diff(primes)
-            
-            # Encoder les gaps
-            gaps_encoded = self.encode_gaps(gaps)
-            
-            return {
-                'chunk_id': chunk_id,
-                'success': True,
-                'num_primes': len(primes),
-                'num_gaps': len(gaps),
-                'gaps_encoded': gaps_encoded,
-                'first_prime': int(primes[0]),
-                'last_prime': int(primes[-1]),
-                'bytes_size': len(gaps_encoded),
-                'needs_connection': prev_prime is not None
-            }
-            
-        except Exception as e:
-            return {
-                'chunk_id': chunk_id,
-                'success': False,
-                'error': str(e)
-            }
-    
     def prepare_chunks(self) -> List[Tuple[int, int, int, Optional[int]]]:
-        """
-        Prépare la liste des chunks à traiter
-        
-        Returns:
-            Liste de (chunk_id, start, stop, prev_prime)
-        """
+        """Prépare la liste des chunks à traiter"""
         chunks = []
         position = self.start_number
         chunk_id = 0
         
-        # Calculer le dernier premier avant start_number si besoin
+        # Dernier premier avant start_number si besoin
         prev_prime = None
         if self.start_number > 2:
-            # Trouver le premier précédent
             search_start = max(2, self.start_number - 1000)
-            primes_before = self.generate_primes_chunk(search_start, self.start_number)
+            primes_before = generate_primes_chunk(search_start, self.start_number)
             if len(primes_before) > 0:
                 prev_prime = int(primes_before[-1])
         
@@ -258,10 +235,7 @@ class ParallelGapsGenerator:
             
             chunks.append((chunk_id, chunk_start, chunk_stop, prev_prime))
             
-            # Pour le prochain chunk, on aura besoin du dernier premier de ce chunk
-            # Mais on ne le connait pas encore, donc on mettra None et on gérera après
             prev_prime = None  # Sera mis à jour dynamiquement
-            
             position = chunk_stop
             chunk_id += 1
         
@@ -269,25 +243,88 @@ class ParallelGapsGenerator:
         
         return chunks
     
-    def write_batch_to_file(self, batch_results: List[Dict], file_handle):
+    def generate_sequential_chunks(self, chunks: List[Tuple]) -> List[Dict]:
         """
-        Écrit un batch de résultats dans le fichier
-        Thread-safe via lock
+        Génère tous les chunks en parallèle puis les reconstitue
         """
-        with self.write_lock:
-            for result in batch_results:
-                if result['success'] and len(result['gaps_encoded']) > 0:
-                    file_handle.write(result['gaps_encoded'].tobytes())
-                    
-                    with self.stats_lock:
-                        self.stats['total_gaps'] += result['num_gaps']
-                        self.stats['total_bytes'] += result['bytes_size']
-                        
-                        if self.stats['first_prime'] is None:
-                            self.stats['first_prime'] = result['first_prime']
-                        
-                        if result['last_prime'] is not None:
-                            self.stats['last_prime'] = result['last_prime']
+        print("\n🔗 Phase 1/2: Génération des chunks en parallèle...")
+        
+        # Générer en parallèle avec contexte 'spawn' pour éviter les problèmes
+        with Pool(processes=self.num_workers) as pool:
+            results = []
+            completed = 0
+            
+            # imap pour avoir les résultats au fur et à mesure
+            for result in pool.imap_unordered(process_chunk_worker, chunks):
+                results.append(result)
+                completed += 1
+                
+                if completed % 100 == 0 or completed == len(chunks):
+                    progress = (completed / len(chunks)) * 100
+                    print(f"\r  Chunks générés: {completed}/{len(chunks)} ({progress:.1f}%)", 
+                          end='', flush=True)
+        
+        print(f"\r  Chunks générés: {len(results)}/{len(chunks)} ✓      ")
+        
+        # Trier par chunk_id
+        results.sort(key=lambda x: x['chunk_id'])
+        
+        print("🔗 Phase 2/2: Reconstruction des connexions...")
+        
+        # Reconstruire les gaps de connexion
+        sequential_results = []
+        prev_last_prime = None
+        
+        for i, result in enumerate(results):
+            if not result['success']:
+                print(f"\n❌ Erreur chunk {result['chunk_id']}: {result.get('error', 'Unknown')}")
+                continue
+            
+            if result['num_primes'] == 0:
+                continue
+            
+            # Recalculer le premier gap si nécessaire
+            if prev_last_prime is not None and result['first_prime'] is not None:
+                connection_gap = result['first_prime'] - prev_last_prime
+                
+                # Décoder
+                gaps_decoded = self.decode_gaps(result['gaps_encoded'])
+                
+                if len(gaps_decoded) > 0:
+                    gaps_decoded[0] = connection_gap
+                
+                # Re-encoder
+                result['gaps_encoded'] = encode_gaps(gaps_decoded)
+                result['bytes_size'] = len(result['gaps_encoded'])
+            
+            sequential_results.append(result)
+            
+            if result['last_prime'] is not None:
+                prev_last_prime = result['last_prime']
+            
+            if (i + 1) % 100 == 0:
+                print(f"\r  Connexions: {i+1}/{len(results)}", end='', flush=True)
+        
+        print(f"\r  Connexions: {len(results)}/{len(results)} ✓      ")
+        
+        return sequential_results
+    
+    def decode_gaps(self, encoded: np.ndarray) -> np.ndarray:
+        """Décode les gaps"""
+        gaps = []
+        i = 0
+        while i < len(encoded):
+            if encoded[i] < 255:
+                gaps.append(encoded[i])
+                i += 1
+            else:
+                high = encoded[i + 1]
+                low = encoded[i + 2]
+                gap = (high << 8) | low
+                gaps.append(gap)
+                i += 3
+        
+        return np.array(gaps, dtype=np.uint64)
     
     def save_checkpoint(self, completed_chunks: int):
         """Sauvegarde un checkpoint"""
@@ -296,7 +333,7 @@ class ParallelGapsGenerator:
             'total_chunks': self.stats['total_chunks'],
             'progress': (completed_chunks / self.stats['total_chunks']) * 100,
             'timestamp': datetime.now().isoformat(),
-            'stats': dict(self.stats)
+            'stats': self.stats  # Déjà un dict simple
         }
         
         with open(self.checkpoint_file, 'w') as f:
@@ -312,6 +349,10 @@ class ParallelGapsGenerator:
                 print(f"✓ Checkpoint trouvé: {checkpoint['completed_chunks']}/{checkpoint['total_chunks']} chunks")
                 print(f"  Progression: {checkpoint['progress']:.1f}%")
                 
+                # Restaurer les stats
+                if 'stats' in checkpoint:
+                    self.stats = checkpoint['stats']
+                
                 return checkpoint['completed_chunks']
             except Exception as e:
                 print(f"⚠ Erreur lecture checkpoint: {e}")
@@ -319,11 +360,11 @@ class ParallelGapsGenerator:
         return None
     
     def format_time(self, seconds: float) -> str:
-        """Formate un temps en format lisible"""
+        """Formate un temps"""
         return str(timedelta(seconds=int(seconds)))
     
     def format_bytes(self, bytes_count: int) -> str:
-        """Formate une taille en bytes"""
+        """Formate une taille"""
         for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
             if bytes_count < 1024:
                 return f"{bytes_count:.2f} {unit}"
@@ -354,88 +395,8 @@ class ParallelGapsGenerator:
               f"ETA: {eta}",
               end='', flush=True)
     
-    def generate_sequential_chunks(self, chunks: List[Tuple]) -> List[Tuple]:
-        """
-        Transforme les chunks pour avoir les connexions correctes
-        Génère d'abord tous les chunks, puis les reconstitue en séquence
-        """
-        print("\n🔗 Phase 1/2: Génération des chunks en parallèle...")
-        
-        # Générer tous les chunks en parallèle
-        with Pool(processes=self.num_workers) as pool:
-            results = []
-            for result in pool.imap_unordered(self.process_chunk, chunks):
-                results.append(result)
-                
-                if len(results) % 10 == 0:
-                    print(f"\r  Chunks générés: {len(results)}/{len(chunks)}", end='', flush=True)
-        
-        print(f"\r  Chunks générés: {len(results)}/{len(chunks)} ✓")
-        
-        # Trier par chunk_id pour avoir l'ordre correct
-        results.sort(key=lambda x: x['chunk_id'])
-        
-        print("🔗 Phase 2/2: Reconstruction des connexions...")
-        
-        # Reconstruire les gaps de connexion
-        sequential_results = []
-        prev_last_prime = None
-        
-        for i, result in enumerate(results):
-            if not result['success']:
-                print(f"\n❌ Erreur chunk {result['chunk_id']}: {result.get('error', 'Unknown')}")
-                continue
-            
-            if result['num_primes'] == 0:
-                continue
-            
-            # Si on a un premier précédent, recalculer le premier gap
-            if prev_last_prime is not None and result['first_prime'] is not None:
-                connection_gap = result['first_prime'] - prev_last_prime
-                
-                # Décoder les gaps existants
-                gaps_decoded = self.decode_gaps(result['gaps_encoded'])
-                
-                # Remplacer le premier gap (si le chunk avait un gap de connexion incorrect)
-                if len(gaps_decoded) > 0:
-                    gaps_decoded[0] = connection_gap
-                
-                # Re-encoder
-                result['gaps_encoded'] = self.encode_gaps(gaps_decoded)
-                result['bytes_size'] = len(result['gaps_encoded'])
-            
-            sequential_results.append(result)
-            
-            if result['last_prime'] is not None:
-                prev_last_prime = result['last_prime']
-            
-            if (i + 1) % 100 == 0:
-                print(f"\r  Connexions: {i+1}/{len(results)}", end='', flush=True)
-        
-        print(f"\r  Connexions: {len(results)}/{len(results)} ✓")
-        
-        return sequential_results
-    
-    def decode_gaps(self, encoded: np.ndarray) -> np.ndarray:
-        """Décode les gaps depuis le format uint8"""
-        gaps = []
-        i = 0
-        while i < len(encoded):
-            if encoded[i] < 255:
-                gaps.append(encoded[i])
-                i += 1
-            else:
-                # Marqueur 255: lire les 2 bytes suivants
-                high = encoded[i + 1]
-                low = encoded[i + 2]
-                gap = (high << 8) | low
-                gaps.append(gap)
-                i += 3
-        
-        return np.array(gaps, dtype=np.uint64)
-    
     def generate(self):
-        """Génération principale parallèle"""
+        """Génération principale"""
         print("=" * 80)
         print("🚀 GÉNÉRATION PARALLÈLE DE GAPS")
         print("=" * 80)
@@ -465,36 +426,59 @@ class ParallelGapsGenerator:
             mode = 'ab' if completed_checkpoint else 'wb'
             
             with open(self.gaps_file, mode) as f:
-                # Traiter en 2 phases pour gérer les connexions
+                # Générer les chunks
                 sequential_results = self.generate_sequential_chunks(chunks)
                 
-                # Écrire les résultats dans l'ordre
+                # Écrire les résultats
                 print("\n💾 Écriture des résultats...")
                 batch = []
                 batch_size_bytes = 0
-                max_batch_bytes = 1024**3  # 1 GB par batch
+                max_batch_bytes = 1024**3  # 1 GB
                 
                 for i, result in enumerate(sequential_results):
+                    if not result['success'] or len(result['gaps_encoded']) == 0:
+                        continue
+                    
                     batch.append(result)
                     batch_size_bytes += result['bytes_size']
                     
-                    # Écrire par batch de 1 GB ou tous les 100 chunks
+                    # Écrire par batch
                     if batch_size_bytes >= max_batch_bytes or len(batch) >= 100:
-                        self.write_batch_to_file(batch, f)
+                        # Écrire le batch
+                        for r in batch:
+                            f.write(r['gaps_encoded'].tobytes())
+                            
+                            self.stats['total_gaps'] += r['num_gaps']
+                            self.stats['total_bytes'] += r['bytes_size']
+                            
+                            if self.stats['first_prime'] is None:
+                                self.stats['first_prime'] = r['first_prime']
+                            
+                            if r['last_prime'] is not None:
+                                self.stats['last_prime'] = r['last_prime']
+                        
                         batch = []
                         batch_size_bytes = 0
                         
-                        # Update stats
+                        # Update progress
                         completed = i + 1 + (completed_checkpoint or 0)
                         self.display_progress(completed, start_time)
                         
-                        # Checkpoint tous les 500 chunks
+                        # Checkpoint
                         if completed % 500 == 0:
                             self.save_checkpoint(completed)
                 
-                # Écrire le dernier batch
+                # Dernier batch
                 if batch:
-                    self.write_batch_to_file(batch, f)
+                    for r in batch:
+                        f.write(r['gaps_encoded'].tobytes())
+                        self.stats['total_gaps'] += r['num_gaps']
+                        self.stats['total_bytes'] += r['bytes_size']
+                        if self.stats['first_prime'] is None:
+                            self.stats['first_prime'] = r['first_prime']
+                        if r['last_prime'] is not None:
+                            self.stats['last_prime'] = r['last_prime']
+                    
                     self.display_progress(len(sequential_results), start_time)
             
             self.stats['end_time'] = datetime.now().isoformat()
@@ -512,7 +496,7 @@ class ParallelGapsGenerator:
             self.save_checkpoint(self.stats['chunks_processed'])
             raise
         
-        # Supprimer checkpoint (génération complète)
+        # Supprimer checkpoint
         if self.checkpoint_file.exists():
             self.checkpoint_file.unlink()
         
@@ -538,7 +522,6 @@ class ParallelGapsGenerator:
         print(f"Workers: {self.num_workers}")
         print(f"Temps total: {self.format_time(elapsed)}")
         print(f"Vitesse: {(self.target - self.start_number) / elapsed:.2e} nombres/s")
-        print(f"Speedup théorique: ~{self.num_workers}x")
         print(f"\n📁 Fichiers:")
         print(f"  • Gaps: {self.gaps_file}")
         print(f"  • Métadonnées: {self.metadata_file}")
@@ -571,22 +554,19 @@ class ParallelGapsGenerator:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Génération parallèle de gaps (32 cores, 256 GB RAM)",
+        description="Génération parallèle de gaps (optimisé multi-core)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemples:
   
-  # Génération 10^13 (optimisé 32 cores)
-  python generate_gaps_parallel.py --target 1e13
+  # Génération 10^13
+  python3.13 generate_gaps_parallel_fixed.py --target 1e13 --workers 28
   
-  # Génération 10^15 avec 28 workers (garde 4 cores libres)
-  python generate_gaps_parallel.py --target 1e15 --workers 28
+  # Génération 10^15 depuis 10^12
+  python3.13 generate_gaps_parallel_fixed.py --start 1e12 --target 1e15 --workers 120
   
-  # Intervalle spécifique: 10^14 à 10^15
-  python generate_gaps_parallel.py --start 1e14 --target 1e15
-  
-  # Buffer mémoire 64 GB (au lieu de 32)
-  python generate_gaps_parallel.py --target 1e15 --buffer 64
+  # Avec buffer personnalisé
+  python3.13 generate_gaps_parallel_fixed.py --target 1e15 --buffer 64 --workers 100
         """
     )
     
@@ -628,9 +608,11 @@ Exemples:
         buffer_size_gb=args.buffer
     )
     
-    # Lancer la génération
+    # Lancer
     generator.generate()
 
 
 if __name__ == "__main__":
+    # Forcer le mode 'spawn' pour éviter les problèmes de fork avec multiprocessing
+    mp.set_start_method('spawn', force=True)
     main()
